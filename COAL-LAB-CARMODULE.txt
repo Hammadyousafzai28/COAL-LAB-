@@ -1,0 +1,262 @@
+#include <Servo.h>
+
+// ── Pin Definitions ──────────────────────────────
+#define Echo   3
+#define Trig   2
+#define motor  5
+#define ENA    6
+#define ENB    11
+#define IN1    7
+#define IN2    8
+#define IN3    9
+#define IN4    10
+
+// ── Constants ────────────────────────────────────
+#define Speed        170
+#define spoint       103    // FIXED: was 95, now matches Code 1
+#define OBSTACLE_CM  14     // FIXED: back to 12 to match Code 1 behavior
+#define SAFE_CM      12     // minimum clearance to act on a direction
+
+// ── Modes ────────────────────────────────────────
+int currentMode = 0;   // 0 = Joystick,  1 = Auto Obstacle
+
+// ── Serial Buffer ────────────────────────────────
+String serialBuffer  = "";
+unsigned long lastCharTime = 0;
+#define BUFFER_TIMEOUT 300
+
+// ── State ────────────────────────────────────────
+char value = 0;
+
+Servo servo;
+
+// ═════════════════════════════════════════════════
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(Trig, OUTPUT);
+  pinMode(Echo, INPUT);
+
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  analogWrite(ENA, Speed);
+  analogWrite(ENB, Speed);
+
+  servo.attach(motor);
+  delay(200);
+  servo.write(spoint);
+  delay(800);             // FIXED: increased from 600 to 800 to match Code 1
+
+  servoBootTest();
+  printBanner();
+}
+
+// ── Boot sweep ──────────────────────────────────
+void servoBootTest() {
+  servo.write(160); delay(800);   // FIXED: 800ms settle like Code 1
+  servo.write(20);  delay(800);
+  servo.write(spoint); delay(800);
+}
+
+// ═════════════════════════════════════════════════
+void loop() {
+  readSerial();
+
+  if (currentMode == 0) {
+    joystickControl();
+  } else {
+    obstacleMode();
+  }
+}
+
+// ═════════════════════════════════════════════════
+//  SERIAL READER
+// ═════════════════════════════════════════════════
+void readSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    lastCharTime = millis();
+
+    if (serialBuffer.length() == 0 &&
+        (c=='F'||c=='B'||c=='L'||c=='R'||c=='S'||
+         c=='G'||c=='I'||c=='H'||c=='J')) {
+      value = c;
+      return;
+    }
+
+    if (c == '\n' || c == '\r') {
+      processKeyword();
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+      if (serialBuffer.equalsIgnoreCase("auto"))   { switchMode(1); serialBuffer = ""; return; }
+      if (serialBuffer.equalsIgnoreCase("manual")) { switchMode(0); serialBuffer = ""; return; }
+      if (serialBuffer.length() > 10)               { serialBuffer = ""; }
+    }
+  }
+
+  if (serialBuffer.length() > 0 && millis() - lastCharTime > BUFFER_TIMEOUT) {
+    serialBuffer = "";
+  }
+}
+
+void processKeyword() {
+  serialBuffer.trim();
+  if (serialBuffer.equalsIgnoreCase("auto"))   switchMode(1);
+  if (serialBuffer.equalsIgnoreCase("manual")) switchMode(0);
+}
+
+void switchMode(int mode) {
+  currentMode = mode;
+  Stop();
+  servo.write(spoint);
+  delay(800);             // FIXED: 800ms
+  value = 0;
+  printBanner();
+}
+
+void printBanner() {
+  Serial.println("==============================");
+  if (currentMode == 0) {
+    Serial.println("   MODE: JOYSTICK CONTROL     ");
+    Serial.println("  Type 'auto'   -> Auto mode  ");
+  } else {
+    Serial.println("    MODE: AUTO OBSTACLE        ");
+    Serial.println("  Type 'manual' -> Joystick   ");
+  }
+  Serial.println("==============================");
+}
+
+// ═════════════════════════════════════════════════
+//  JOYSTICK CONTROL
+// ═════════════════════════════════════════════════
+void joystickControl() {
+  switch (value) {
+    case 'F': forward();       break;
+    case 'B': backward();      break;
+    case 'L': spinLeft();      break;
+    case 'R': spinRight();     break;
+    case 'S': Stop();          break;
+    case 'G': forwardLeft();   break;
+    case 'I': forwardRight();  break;
+    case 'H': backwardLeft();  break;
+    case 'J': backwardRight(); break;
+  }
+}
+
+// ═════════════════════════════════════════════════
+//  AUTO OBSTACLE — mirrors Code 1 logic exactly
+// ═════════════════════════════════════════════════
+void obstacleMode() {
+  int frontDist = ultrasonic();   // FIXED: single raw read like Code 1, no median overhead
+
+  Serial.print("Front: "); Serial.print(frontDist); Serial.println(" cm");
+
+  if (frontDist <= OBSTACLE_CM) {
+    Stop();
+    backward();
+    delay(100);
+    Stop();
+
+    // ── Scan LEFT ──────────────────────────────
+    servo.write(180);
+    delay(800);                   // FIXED: 800ms to fully settle like Code 1
+    int L = ultrasonic();
+    Serial.print("Left: "); Serial.print(L); Serial.println(" cm");
+
+    servo.write(spoint);
+    delay(800);                   // FIXED: return to center and settle
+
+    // ── Scan RIGHT ─────────────────────────────
+    servo.write(20);
+    delay(800);
+    int R = ultrasonic();
+    Serial.print("Right: "); Serial.print(R); Serial.println(" cm");
+
+    servo.write(spoint);
+    delay(800);
+
+    // ── Decide ─────────────────────────────────
+    if (L < R) {
+      spinRight();
+      delay(500);
+      Stop();
+      delay(200);
+    } else if (L > R) {
+      spinLeft();
+      delay(500);
+      Stop();
+      delay(200);
+    } else {
+      // Equal — keep reversing
+      backward();
+      delay(400);
+      Stop();
+    }
+
+  } else {
+    forward();
+  }
+}
+
+// ═════════════════════════════════════════════════
+//  ULTRASONIC — single clean read (like Code 1)
+// ═════════════════════════════════════════════════
+int ultrasonic() {
+  digitalWrite(Trig, LOW);
+  delayMicroseconds(4);
+  digitalWrite(Trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(Trig, LOW);
+  long t  = pulseIn(Echo, HIGH, 25000);  // 25ms timeout
+  if (t == 0) return 999;                // no echo = open space
+  long cm = t / 29 / 2;
+  return (int)cm;
+}
+
+// ═════════════════════════════════════════════════
+//  MOTOR FUNCTIONS
+// ═════════════════════════════════════════════════
+void forward() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void backward() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+void spinLeft() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void spinRight() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+void forwardLeft() {
+  analogWrite(ENA, Speed / 2); analogWrite(ENB, Speed);
+  forward();
+}
+void forwardRight() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed / 2);
+  forward();
+}
+void backwardLeft() {
+  analogWrite(ENA, Speed / 2); analogWrite(ENB, Speed);
+  backward();
+}
+void backwardRight() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed / 2);
+  backward();
+}
+void Stop() {
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
